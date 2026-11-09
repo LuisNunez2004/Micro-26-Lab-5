@@ -181,6 +181,8 @@ void procesar_tramas_bluetooth(void) {
 // =========================================================================
 // 5. PROGRAMA PRINCIPAL
 // =========================================================================
+// ETAPA 2: Lógica de la Máquina de Estados (FSM Cooperativa) y control energetico con el registro PRR.
+
 int main(void)
 {
 	// Captura inicial de la causa en la simulación
