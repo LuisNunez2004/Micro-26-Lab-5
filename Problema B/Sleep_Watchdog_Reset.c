@@ -1,3 +1,5 @@
+// ETAPA 1: Inicializacion de USART0, Buferes Circulares e Init0 para Reset r2.
+
 #define F_CPU 16000000UL
 #include <avr/io.h>
 #include <avr/interrupt.h>
