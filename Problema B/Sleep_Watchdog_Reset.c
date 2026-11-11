@@ -1,311 +1,1087 @@
-// ETAPA 1: Inicializacion de USART0, Buferes Circulares e Init0 para Reset r2.
 
+/*
+ * LABORATORIO 5 - PROBLEMA B
+ * ATmega328P - 16 MHz - PROTEUS
+ *
+ * PB0: LED verde
+ * PB1: LED amarillo
+ * PB2: Actuador opcional
+ * PD2: Pulsador DESPERTAR
+ * PC0: Potenciometro ADC
+ * PC4: SDA
+ * PC5: SCL
+ *
+ * PCF8574: direccion 0x20
+ *
+ * ACTIVO: lectura ADC y LCD
+ * 10 segundos: STANDBY / IDLE
+ * 30 segundos: POWER-DOWN
+ * WDT interrupcion cada 8 segundos
+ * Pulsador: despertar
+ * Pulsacion larga: bloqueo y reset WDT
+ *
+ * UART: 9600 bps
+ * Tramas [CDHH]
+ * HH = XOR ASCII de C y D
+ *
+ * Sin switch-case.
+ * Sin bibliotecas TWI externas.
+ */
+
+#ifndef F_CPU
 #define F_CPU 16000000UL
+#endif
+
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
 #include <avr/sleep.h>
+#include <util/atomic.h>
 #include <util/delay.h>
 #include <stdint.h>
 #include <stdio.h>
 
-// --- Definición Exhaustiva de Estados (FSM) ---
-#define ESTADO_ACTIVO  0
-#define ESTADO_STANDBY 1
-#define ESTADO_APAGADO 2
+/* DEFINICIONES */
 
-// --- Asignación Estricta de Hardware ---
-#define LED_ACTIVO    PB0   // LED Verde (Indica Estado Activo)
-#define LED_BLOQUEO   PB1   // LED Amarillo (Indica Standby o Falla de Software)
-#define BOTON_ACT     PD2   // Pulsador Físico de Actividad / Despertar (INT0)
-#define CANAL_ADC     0     // PC0 / Entrada del Potenciómetro
+#define VERDE       PB0
+#define AMARILLO    PB1
+#define ACTUADOR    PB2
+#define BOTON       PD2
 
-// --- Configuración del Protocolo de Tramas Bluetooth (HC-05) ---
-#define TRAMA_START '['
-#define TRAMA_STOP  ']'
-#define BUFFER_SIZE 32
+#define LCD_ADDR    0x27U
+#define RS          0x01U
+#define EN          0x04U
+#define BL          0x08U
 
-// --- Variables Globales de Sistema ---
-uint8_t causa_reset_real __attribute__((section(".noinit")));
-volatile uint8_t estado_actual = ESTADO_ACTIVO;
-volatile uint32_t contador_ms = 0;
-volatile uint32_t ultimo_evento = 0;
-char buffer_diagnostico[64];
+#define ACTIVO      0U
+#define STANDBY     1U
+#define APAGADO     2U
+#define SEGURO      3U
 
-// Búferes Circulares para UART
-volatile char rx_ring[BUFFER_SIZE];
-volatile uint8_t rx_head = 0; volatile uint8_t rx_tail = 0;
+#define RX_N        32U
 
-volatile char tx_ring[BUFFER_SIZE];
-volatile uint8_t tx_head = 0; volatile uint8_t tx_tail = 0;
+/* CAUSA DE REINICIO */
 
-volatile uint8_t despertado_por_wdt_8s = 0;
+uint8_t causa_reset
+__attribute__((section(".noinit")));
 
-// =========================================================================
-// 1. CAPTURA TEMPRANA DE LA CAUSA DEL RESET (.init0)
-// =========================================================================
-void capturar_causa_real(void) __attribute__((naked, section(".init0")));
-void capturar_causa_real(void) {
-	if (MCUSR == 0) {
-		__asm__ __volatile__("sts causa_reset_real, r2 \n\t");
-		} else {
-		causa_reset_real = MCUSR;
-	}
-	MCUSR = 0;
-	wdt_disable();
+void capturar_reset(void)
+__attribute__((naked, used, section(".init3")));
+
+void capturar_reset(void)
+{
+    causa_reset = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
 }
 
-// =========================================================================
-// 2. CONTROLADORES DE INTERRUPCIÓN (ISR)
-// =========================================================================
-ISR(USART_RX_vect) {
-	char dato = UDR0;
-	uint8_t sig = (rx_head + 1) % BUFFER_SIZE;
-	if (sig != rx_tail) {
-		rx_ring[rx_head] = dato;
-		rx_head = sig;
-	}
-	ultimo_evento = contador_ms;
+/* VARIABLES GLOBALES */
+
+static volatile uint32_t ms = 0;
+
+static volatile uint8_t evento_boton = 0;
+static volatile uint8_t evento_wdt = 0;
+static volatile uint8_t despertadores_wdt = 0;
+
+static volatile uint8_t rx[RX_N];
+static volatile uint8_t rx_in = 0;
+static volatile uint8_t rx_out = 0;
+
+static uint8_t estado = ACTIVO;
+static uint8_t lcd_ok = 1;
+static uint8_t luz = BL;
+
+static uint32_t ultima_actividad = 0;
+static uint16_t ultimo_adc = 0;
+
+/* INTERRUPCIONES */
+
+ISR(TIMER1_COMPA_vect)
+{
+    ms += 100UL;
 }
 
-ISR(USART_UDRE_vect) {
-	if (tx_tail != tx_head) {
-		UDR0 = tx_ring[tx_tail];
-		tx_tail = (tx_tail + 1) % BUFFER_SIZE;
-		} else {
-		UCSR0B &= ~(1 << UDRIE0);
-	}
+ISR(INT0_vect)
+{
+    evento_boton = 1;
+    EIMSK &= (uint8_t)~(1U << INT0);
 }
 
-ISR(TIMER1_COMPA_vect) {
-	contador_ms++;
+ISR(WDT_vect)
+{
+    evento_wdt = 1;
+
+    if (despertadores_wdt != 255U)
+        despertadores_wdt++;
 }
 
-ISR(INT0_vect) {
-	ultimo_evento = contador_ms;
+ISR(USART_RX_vect)
+{
+    uint8_t c = UDR0;
+
+    uint8_t siguiente =
+        (uint8_t)((rx_in + 1U) & (RX_N - 1U));
+
+    if (siguiente != rx_out)
+    {
+        rx[rx_in] = c;
+        rx_in = siguiente;
+    }
 }
 
-ISR(WDT_vect) {
-	despertado_por_wdt_8s = 1;
+/* TIMER1 - BASE DE TIEMPO */
+
+static uint32_t ahora_ms(void)
+{
+    uint32_t t;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        t = ms;
+    }
+
+    return t;
 }
 
-// =========================================================================
-// 3. MÓDULOS DE CONFIGURACIÓN Y REDUCCIÓN DE POTENCIA (PRR)
-// =========================================================================
-void uart_configurar(void) {
-	PRR &= ~(1 << PRUSART0);
-	UBRR0H = 0; UBRR0L = 103; // 9600 bps a 16MHz
-	UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
-	UCSR0B = (1 << TXEN0) | (1 << RXEN0) | (1 << RXCIE0);
+static void iniciar_timer1(void)
+{
+    PRR &= (uint8_t)~(1U << PRTIM1);
+
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TCNT1 = 0;
+
+    OCR1A = 6249U;
+
+    TIFR1 = (1U << OCF1A);
+    TIMSK1 = (1U << OCIE1A);
+
+    TCCR1B =
+        (1U << WGM12) |
+        (1U << CS12);
 }
 
-void uart_enviar_char(char c) {
-	uint8_t sig = (tx_head + 1) % BUFFER_SIZE;
-	while (sig == tx_tail);
-	tx_ring[tx_head] = c;
-	tx_head = sig;
-	UCSR0B |= (1 << UDRIE0);
+/* ADC */
+
+static void iniciar_adc(void)
+{
+    PRR &= (uint8_t)~(1U << PRADC);
+
+    ADMUX = (1U << REFS0);
+
+    ADCSRA =
+        (1U << ADEN) |
+        (1U << ADPS2) |
+        (1U << ADPS1) |
+        (1U << ADPS0);
+
+    DIDR0 |= (1U << ADC0D);
 }
 
-void uart_enviar(const char *texto) {
-	while (*texto) { uart_enviar_char(*texto++); }
+static uint16_t leer_adc(void)
+{
+    ADCSRA |= (1U << ADSC);
+
+    while (ADCSRA & (1U << ADSC))
+    {
+    }
+
+    return ADC;
 }
 
-void adc_configurar(void) {
-	PRR &= ~(1 << PRADC);
-	ADMUX = (1 << REFS0) | (CANAL_ADC & 0x0F);
-	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+/* UART 9600 BAUDIOS */
+
+static void iniciar_uart(void)
+{
+    PRR &= (uint8_t)~(1U << PRUSART0);
+
+    UBRR0H = 0;
+    UBRR0L = 103;
+
+    UCSR0A = 0;
+
+    UCSR0C =
+        (1U << UCSZ01) |
+        (1U << UCSZ00);
+
+    UCSR0B =
+        (1U << RXEN0) |
+        (1U << TXEN0) |
+        (1U << RXCIE0);
 }
 
-uint16_t adc_leer(void) {
-	ADCSRA |= (1 << ADSC);
-	while (ADCSRA & (1 << ADSC));
-	return ADC;
+static void uart_caracter(char c)
+{
+    uint16_t espera = 60000U;
+
+    while (!(UCSR0A & (1U << UDRE0)) && espera)
+    {
+        espera--;
+    }
+
+    if (espera)
+        UDR0 = (uint8_t)c;
 }
 
-void timer1_configurar(void) {
-	PRR &= ~(1 << PRTIM1);
-	TCCR1A = 0;
-	TCCR1B = (1 << WGM12) | (1 << CS11); // CTC con prescaler 8
-	OCR1A = 1999; // Interrupción cada exactamente 1ms
-	TIMSK1 |= (1 << OCIE1A);
+static void uart_texto(const char *p)
+{
+    while (*p)
+        uart_caracter(*p++);
 }
 
-// =========================================================================
-// 4. PROCESAMIENTO ASÍNCRONO DE TRAMAS BLUETOOTH
-// =========================================================================
-void procesar_tramas_bluetooth(void) {
-	uint8_t disp = (rx_head >= rx_tail) ? (rx_head - rx_tail) : (BUFFER_SIZE - rx_tail + rx_head);
-	if (disp < 5) return;
+/* I2C */
 
-	if (rx_ring[rx_tail] != TRAMA_START) {
-		rx_tail = (rx_tail + 1) % BUFFER_SIZE;
-		return;
-	}
+static uint8_t twi_esperar(void)
+{
+    uint16_t espera = 30000U;
 
-	uint8_t i_cmd = (rx_tail + 1) % BUFFER_SIZE;
-	uint8_t i_dat = (rx_tail + 2) % BUFFER_SIZE;
-	uint8_t i_chk = (rx_tail + 3) % BUFFER_SIZE;
-	uint8_t i_stp = (rx_tail + 4) % BUFFER_SIZE;
+    while (!(TWCR & (1U << TWINT)) && espera)
+    {
+        espera--;
+    }
 
-	if (rx_ring[i_stp] != TRAMA_STOP) {
-		rx_tail = (rx_tail + 1) % BUFFER_SIZE;
-		return;
-	}
-
-	char cmd  = rx_ring[i_cmd];
-	char dato = rx_ring[i_dat];
-	char chk  = rx_ring[i_chk];
-	rx_tail = (rx_tail + 5) % BUFFER_SIZE;
-
-	if ((char)(cmd + dato) != chk) {
-		uart_enviar("[BT_ERROR] Checksum invalido.\r\n");
-		return;
-	}
-
-	if (cmd == 'S') {
-		snprintf(buffer_diagnostico, sizeof(buffer_diagnostico), "[APP] Estado: %d\r\n", estado_actual);
-		uart_enviar(buffer_diagnostico);
-	}
-	else if (cmd == 'R') {
-		uint16_t pot = adc_leer();
-		snprintf(buffer_diagnostico, sizeof(buffer_diagnostico), "[APP] Pot: %d\r\n", pot);
-		uart_enviar(buffer_diagnostico);
-	}
-	else if (cmd == 'E') {
-		if (dato == 'A') { estado_actual = ESTADO_ACTIVO; ultimo_evento = contador_ms; uart_enviar("[BT] FSM -> ACTIVO\r\n"); }
-		if (dato == 'S') { estado_actual = ESTADO_STANDBY; uart_enviar("[BT] FSM -> STANDBY\r\n"); }
-	}
+    return espera != 0U;
 }
 
-// =========================================================================
-// 5. PROGRAMA PRINCIPAL
-// =========================================================================
-// ETAPA 2: Lógica de la Máquina de Estados (FSM Cooperativa) y control energetico con el registro PRR.
+static void iniciar_i2c(void)
+{
+    PRR &= (uint8_t)~(1U << PRTWI);
+
+    TWSR = 0;
+    TWBR = 72U;
+    TWCR = (1U << TWEN);
+}
+
+static void twi_stop(void)
+{
+    TWCR =
+        (1U << TWINT) |
+        (1U << TWSTO) |
+        (1U << TWEN);
+}
+
+static uint8_t twi_start(void)
+{
+    TWCR =
+        (1U << TWINT) |
+        (1U << TWSTA) |
+        (1U << TWEN);
+
+    if (!twi_esperar())
+        return 0U;
+
+    return
+        ((TWSR & 0xF8U) == 0x08U ||
+         (TWSR & 0xF8U) == 0x10U);
+}
+
+static uint8_t twi_dato(uint8_t dato)
+{
+    TWDR = dato;
+
+    TWCR =
+        (1U << TWINT) |
+        (1U << TWEN);
+
+    if (!twi_esperar())
+        return 0U;
+
+    return
+        ((TWSR & 0xF8U) == 0x18U ||
+         (TWSR & 0xF8U) == 0x28U);
+}
+
+/* LCD POR PCF8574 */
+
+static void pcf(uint8_t dato)
+{
+    uint8_t bien;
+
+    if (!lcd_ok)
+        return;
+
+    if (!twi_start())
+    {
+        twi_stop();
+        lcd_ok = 0;
+        return;
+    }
+
+    bien = twi_dato(
+        (uint8_t)(LCD_ADDR << 1));
+
+    if (bien)
+        bien = twi_dato(dato);
+
+    twi_stop();
+
+    if (!bien)
+        lcd_ok = 0;
+}
+
+static void lcd_nibble(uint8_t dato, uint8_t rs)
+{
+    uint8_t p =
+        (uint8_t)((dato & 0xF0U) | luz | rs);
+
+    pcf((uint8_t)(p | EN));
+    _delay_us(2);
+
+    pcf(p);
+    _delay_us(50);
+}
+
+static void lcd_byte(uint8_t dato, uint8_t rs)
+{
+    lcd_nibble(dato, rs);
+
+    lcd_nibble((uint8_t)(dato << 4), rs);
+}
+
+static void lcd_cmd(uint8_t dato)
+{
+    lcd_byte(dato, 0);
+
+    if (dato == 1U || dato == 2U)
+        _delay_ms(2);
+}
+
+static void iniciar_lcd(void)
+{
+    lcd_ok = 1;
+    luz = BL;
+
+    _delay_ms(40);
+
+    lcd_nibble(0x30, 0);
+    _delay_ms(5);
+
+    lcd_nibble(0x30, 0);
+    _delay_us(200);
+
+    lcd_nibble(0x30, 0);
+    lcd_nibble(0x20, 0);
+
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_cmd(0x01);
+}
+
+static void lcd_linea(
+    uint8_t direccion,
+    const char *texto)
+{
+    uint8_t n = 0;
+
+    if (!lcd_ok)
+        return;
+
+    lcd_cmd(direccion);
+
+    while (*texto && n < 16U)
+    {
+        lcd_byte((uint8_t)*texto++, RS);
+        n++;
+    }
+
+    while (n < 16U)
+    {
+        lcd_byte(' ', RS);
+        n++;
+    }
+}
+
+static void lcd_mostrar(
+    const char *a,
+    const char *b)
+{
+    if (!lcd_ok)
+    {
+        iniciar_i2c();
+        iniciar_lcd();
+    }
+
+    lcd_linea(0x80, a);
+    lcd_linea(0xC0, b);
+}
+
+/* CONFIGURACION DEL WATCHDOG */
+
+static void wdt_config(uint8_t valor)
+{
+    uint8_t previo = SREG;
+
+    uint8_t apertura =
+        (1U << WDCE) |
+        (1U << WDE);
+
+    cli();
+
+    wdt_reset();
+
+    MCUSR &= (uint8_t)~(1U << WDRF);
+
+    __asm__ __volatile__(
+        "sts %[reg], %[a]\n\t"
+        "sts %[reg], %[b]\n\t"
+        :
+        : [reg] "n" (_SFR_MEM_ADDR(WDTCSR)),
+          [a] "r" (apertura),
+          [b] "r" (valor)
+        : "memory"
+    );
+
+    SREG = previo;
+}
+
+/* WDT MODO RESET: 2 SEGUNDOS */
+
+static void wdt_reset_2s(void)
+{
+    wdt_config(
+        (1U << WDE) |
+        (1U << WDP2) |
+        (1U << WDP1) |
+        (1U << WDP0)
+    );
+}
+
+/* WDT MODO INTERRUPCION: 8 SEGUNDOS */
+
+static void wdt_interrupt_8s(void)
+{
+    wdt_config(
+        (1U << WDIE) |
+        (1U << WDP3) |
+        (1U << WDP0)
+    );
+}
+
+/* CONFIGURACION INT0 */
+
+static void int0_standby(void)
+{
+    EIMSK &= (uint8_t)~(1U << INT0);
+
+    EICRA =
+        (uint8_t)(
+            (EICRA &
+             (uint8_t)~(
+                (1U << ISC01) |
+                (1U << ISC00)
+             )) |
+            (1U << ISC01)
+        );
+
+    EIFR = (1U << INTF0);
+    evento_boton = 0;
+
+    EIMSK |= (1U << INT0);
+}
+
+static void int0_powerdown(void)
+{
+    EIMSK &= (uint8_t)~(1U << INT0);
+
+    EICRA &=
+        (uint8_t)~(
+            (1U << ISC01) |
+            (1U << ISC00)
+        );
+
+    EIFR = (1U << INTF0);
+    evento_boton = 0;
+
+    EIMSK |= (1U << INT0);
+}
+
+/* PRUEBA DE BLOQUEO POR WDT */
+
+static void bloquear_por_wdt(void)
+{
+    lcd_mostrar(
+        "BLOQUEO SIMULADO",
+        "RESET VIA WDT"
+    );
+
+    PORTB &= (uint8_t)~(1U << VERDE);
+    PORTB |= (1U << AMARILLO);
+
+    wdt_reset_2s();
+
+    cli();
+
+    for (;;)
+    {
+        /* No alimentar al Watchdog */
+        __asm__ __volatile__("nop");
+    }
+}
+
+/* PROTOCOLO UART */
+
+static uint8_t hex_valor(uint8_t c)
+{
+    if (c >= '0' && c <= '9')
+        return (uint8_t)(c - '0');
+
+    if (c >= 'A' && c <= 'F')
+        return (uint8_t)(c - 'A' + 10);
+
+    if (c >= 'a' && c <= 'f')
+        return (uint8_t)(c - 'a' + 10);
+
+    return 255U;
+}
+
+static void comando(uint8_t c, uint8_t d)
+{
+    char linea[40];
+
+    if (c == '!' && d == '1')
+    {
+        estado = SEGURO;
+
+        PORTB &= (uint8_t)~(1U << ACTUADOR);
+
+        uart_texto("[EMERGENCIA]\r\n");
+    }
+
+    else if (c == 'S' && d == '0')
+    {
+        const char *e =
+            (estado == ACTIVO) ? "ACTIVO" :
+            (estado == STANDBY) ? "STANDBY" :
+            (estado == APAGADO) ? "APAGADO" :
+            "SEGURO";
+
+        snprintf(
+            linea,
+            sizeof(linea),
+            "[ESTADO:%s]\r\n",
+            e
+        );
+
+        uart_texto(linea);
+    }
+
+    else if (c == 'R' && d == '0' &&
+             estado != SEGURO)
+    {
+        if (!(ADCSRA & (1U << ADEN)))
+            iniciar_adc();
+
+        ultimo_adc = leer_adc();
+
+        snprintf(
+            linea,
+            sizeof(linea),
+            "[ADC:%u]\r\n",
+            (unsigned)ultimo_adc
+        );
+
+        uart_texto(linea);
+    }
+
+    else if (c == 'A' && d == '0')
+    {
+        snprintf(
+            linea,
+            sizeof(linea),
+            "[WDT:%u RESET:%u]\r\n",
+            (unsigned)despertadores_wdt,
+            (unsigned)(
+                (causa_reset & (1U << WDRF)) != 0U
+            )
+        );
+
+        uart_texto(linea);
+    }
+
+    else if (c == 'E' &&
+             estado != SEGURO &&
+             (d == 'A' || d == 'S' || d == 'P'))
+    {
+        estado =
+            (d == 'A') ? ACTIVO :
+            (d == 'S') ? STANDBY :
+            APAGADO;
+
+        uart_texto("[ESTADO OK]\r\n");
+    }
+
+    else if (c == 'L' &&
+             estado != SEGURO &&
+             (d == '0' || d == '1'))
+    {
+        if (d == '1')
+            PORTB |= (1U << ACTUADOR);
+        else
+            PORTB &= (uint8_t)~(1U << ACTUADOR);
+
+        uart_texto("[ACTUADOR OK]\r\n");
+    }
+
+    else
+    {
+        uart_texto("[COMANDO ERROR]\r\n");
+        return;
+    }
+
+    ultima_actividad = ahora_ms();
+
+    if (estado == STANDBY &&
+        !(c == 'E' && d == 'S'))
+    {
+        estado = ACTIVO;
+    }
+}
+
+static void procesar_uart(void)
+{
+    static uint8_t trama[6];
+    static uint8_t indice = 0;
+
+    uint8_t maximo = RX_N;
+
+    while (rx_out != rx_in && maximo--)
+    {
+        uint8_t c = rx[rx_out];
+        uint8_t h, l;
+
+        rx_out =
+            (uint8_t)((rx_out + 1U) &
+                      (RX_N - 1U));
+
+        if (c == '[')
+        {
+            trama[0] = '[';
+            indice = 1;
+            continue;
+        }
+
+        if (!indice)
+            continue;
+
+        trama[indice++] = c;
+
+        if (indice < 6U)
+            continue;
+
+        indice = 0;
+
+        h = hex_valor(trama[3]);
+        l = hex_valor(trama[4]);
+
+        if (trama[5] != ']' ||
+            h > 15U ||
+            l > 15U ||
+            (uint8_t)(trama[1] ^ trama[2]) !=
+            (uint8_t)((h << 4) | l))
+        {
+            uart_texto("[TRAMA ERROR]\r\n");
+        }
+        else
+        {
+            comando(trama[1], trama[2]);
+        }
+    }
+}
+
+/* MODO POWER-DOWN */
+
+static void entrar_powerdown(void)
+{
+    lcd_mostrar(
+        "MODO POWER-DOWN",
+        "WDT CADA 8 SEG"
+    );
+
+    uart_texto("[POWER-DOWN]\r\n");
+
+    luz = 0;
+    pcf(0);
+
+    PORTB &=
+        (uint8_t)~(
+            (1U << VERDE) |
+            (1U << AMARILLO) |
+            (1U << ACTUADOR)
+        );
+
+    /* Deshabilitar perifericos */
+
+    UCSR0B = 0;
+    ADCSRA &= (uint8_t)~(1U << ADEN);
+    TWCR = 0;
+
+    ACSR |= (1U << ACD);
+
+    PRR |=
+        (1U << PRADC) |
+        (1U << PRUSART0) |
+        (1U << PRSPI) |
+        (1U << PRTIM1) |
+        (1U << PRTIM0) |
+        (1U << PRTIM2) |
+        (1U << PRTWI);
+
+    int0_powerdown();
+
+    evento_wdt = 0;
+
+    /* Watchdog modo interrupcion */
+
+    wdt_interrupt_8s();
+
+    for (;;)
+    {
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+
+        cli();
+        sleep_enable();
+        sei();
+
+        sleep_cpu();
+        sleep_disable();
+
+        /* DESPERTAR CON PULSADOR */
+
+        if (evento_boton ||
+            !(PIND & (1U << BOTON)))
+        {
+            EIMSK &= (uint8_t)~(1U << INT0);
+            evento_boton = 0;
+
+            wdt_reset_2s();
+
+            PRR &=
+                (uint8_t)~(
+                    (1U << PRADC) |
+                    (1U << PRUSART0) |
+                    (1U << PRTWI) |
+                    (1U << PRTIM1)
+                );
+
+            iniciar_timer1();
+            iniciar_adc();
+            iniciar_uart();
+            iniciar_i2c();
+            iniciar_lcd();
+
+            estado = ACTIVO;
+            ultima_actividad = ahora_ms();
+
+            lcd_mostrar(
+                "DESPERTO INT0",
+                "ESTADO: ACTIVO"
+            );
+
+            uart_texto("[DESPERTO INT0]\r\n");
+
+            wdt_reset();
+
+            return;
+        }
+
+        /* DESPERTAR CADA 8 SEGUNDOS */
+
+        if (evento_wdt)
+        {
+            evento_wdt = 0;
+
+            iniciar_adc();
+            _delay_us(100);
+
+            ultimo_adc = leer_adc();
+
+            ADCSRA &= (uint8_t)~(1U << ADEN);
+            PRR |= (1U << PRADC);
+
+            PORTB |= (1U << AMARILLO);
+
+            _delay_ms(60);
+
+            PORTB &= (uint8_t)~(1U << AMARILLO);
+        }
+    }
+}
+
+/* PROGRAMA PRINCIPAL */
 
 int main(void)
 {
-	// Captura inicial de la causa en la simulación
-	causa_reset_real = MCUSR;
-	MCUSR = 0;
-	wdt_disable();
+    uint32_t t;
+    uint32_t ultima_lcd;
+    uint32_t inicio_pulsacion = 0;
 
-	cli();
-	DDRB |= (1 << LED_ACTIVO) | (1 << LED_BLOQUEO);
-	PORTB &= ~((1 << LED_ACTIVO) | (1 << LED_BLOQUEO));
+    uint8_t presion_anterior = 0;
+    uint8_t mostrar_standby = 1;
+    uint8_t mostrar_seguro = 1;
 
-	DDRD &= ~(1 << BOTON_ACT); PORTD |= (1 << BOTON_ACT);
+    char linea[17];
 
-	EICRA = 0; EIMSK |= (1 << INT0);
+    cli();
 
-	uart_configurar();
-	adc_configurar();
-	timer1_configurar();
-	sei();
+    /* LED */
 
-	if (causa_reset_real & (1 << WDRF)) {
-		uart_enviar("\r\n[SISTEMA RECUPERADO] Reinicio provocado por Watchdog Timer.\r\n");
-		} else {
-		uart_enviar("\r\n[ARRANQUE NORMAL] Inicializando sistema cooperativo en C...\r\n");
-	}
+    DDRB |=
+        (1U << VERDE) |
+        (1U << AMARILLO) |
+        (1U << ACTUADOR);
 
-	uint32_t ultimo_muestreo_normal = 0;
+    PORTB =
+        (uint8_t)(
+            (PORTB | (1U << VERDE)) &
+            (uint8_t)~(
+                (1U << AMARILLO) |
+                (1U << ACTUADOR)
+            )
+        );
 
-	while (1)
-	{
-		procesar_tramas_bluetooth();
-		
-		if (estado_actual == ESTADO_ACTIVO)
-		{
-			PRR = 0x00;
-			PORTB |= (1 << LED_ACTIVO); PORTB &= ~(1 << LED_BLOQUEO);
+    /* PULSADOR */
 
-			if (contador_ms - ultimo_muestreo_normal >= 500) {
-				ultimo_muestreo_normal = contador_ms;
-				uint16_t pot_val = adc_leer();
-				snprintf(buffer_diagnostico, sizeof(buffer_diagnostico), "Ejecutando normal | ADC: %d\r\n", pot_val);
-				uart_enviar(buffer_diagnostico);
-			}
+    DDRD &= (uint8_t)~(1U << BOTON);
+    PORTD |= (1U << BOTON);
 
-			if (!(PIND & (1 << BOTON_ACT))) { ultimo_evento = contador_ms; }
+    EIMSK &= (uint8_t)~(1U << INT0);
 
-			if (contador_ms - ultimo_evento >= 10000) {
-				estado_actual = ESTADO_STANDBY;
-				uart_enviar("10 segundos sin actividad. Transicion a STANDBY.\r\n");
-			}
+    /* PERIFERICOS */
 
-			wdt_enable(WDTO_2S);
-			wdt_reset();
-		}
-		else if (estado_actual == ESTADO_STANDBY)
-		{
-			PRR = (1 << PRSPI) | (1 << PRTWI);
-			PORTB &= ~(1 << LED_ACTIVO); PORTB |= (1 << LED_BLOQUEO);
+    iniciar_timer1();
+    iniciar_adc();
+    iniciar_uart();
+    iniciar_i2c();
+    iniciar_lcd();
 
-			if (!(PIND & (1 << BOTON_ACT))) {
-				ultimo_evento = contador_ms;
-				estado_actual = ESTADO_ACTIVO;
-				uart_enviar("[EVENTO VÁLIDO] Volviendo a Estado ACTIVO.\r\n");
-			}
+    sei();
 
-			if (contador_ms - ultimo_evento >= 30000) {
-				estado_actual = ESTADO_APAGADO;
-			}
+    /* CAUSA DEL RESET */
 
-			wdt_enable(WDTO_2S);
-			wdt_reset();
+    if (causa_reset & (1U << WDRF))
+    {
+        lcd_mostrar(
+            "SYS RECUPERADO",
+            "RESET VIA WDT"
+        );
 
-			set_sleep_mode(SLEEP_MODE_IDLE);
-			sleep_mode();
-		}
-		else if (estado_actual == ESTADO_APAGADO)
-		{
-			uart_enviar("30 segundos cumplidos. Entrando en Power-Down...\r\n");
-			while (tx_tail != tx_head);
-			_delay_ms(20);
+        uart_texto("[RECUPERADO WDT]\r\n");
+    }
+    else
+    {
+        lcd_mostrar(
+            "ARRANQUE NORMAL",
+            "SISTEMA ACTIVO"
+        );
 
-			PORTB &= ~((1 << LED_ACTIVO) | (1 << LED_BLOQUEO));
-			PRR = (1 << PRADC) | (1 << PRUSART0) | (1 << PRSPI) | (1 << PRTIM1) | (1 << PRTIM0) | (1 << PRTIM2) | (1 << PRTWI);
+        uart_texto("[ARRANQUE NORMAL]\r\n");
+    }
 
-			cli();
-			MCUSR &= ~(1 << WDRF);
-			WDTCSR |= (1 << WDCE) | (1 << WDE);
-			WDTCSR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
-			sei();
+    _delay_ms(800);
 
-			set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-			sleep_mode();
+    t = ahora_ms();
 
-			PRR = 0x00;
-			uart_configurar();
-			adc_configurar();
-			timer1_configurar();
+    ultima_actividad = t;
+    ultima_lcd = t;
 
-			if (despertado_por_wdt_8s) {
-				despertado_por_wdt_8s = 0;
-				uart_enviar("[DESPERTAR WDT] Transmitiendo lectura en reposo de 8s.\r\n");
-				uint16_t lectura_rapida = adc_leer();
-				snprintf(buffer_diagnostico, sizeof(buffer_diagnostico), "[PRUEBA A DATA] ADC post-sueño: %d\r\n", lectura_rapida);
-				uart_enviar(buffer_diagnostico);
-			}
+    wdt_reset_2s();
+    wdt_reset();
 
-			contador_ms = 0;
-			ultimo_evento = contador_ms;
-			estado_actual = ESTADO_ACTIVO;
-		}
+    /* BUCLE PRINCIPAL */
 
-		// --- SIMULACIÓN DE BLOQUEO CRÍTICO (PRUEBA B RESET) ---
-		if (estado_actual == ESTADO_ACTIVO && !(PIND & (1 << BOTON_ACT)) && (contador_ms - ultimo_evento > 3000)) {
-			PORTB &= ~(1 << LED_ACTIVO);
-			PORTB |= (1 << LED_BLOQUEO);
-			uart_enviar("!!! SIMULACIÓN DE BLOQUEO CRÍTICO !!! Entrando en bucle infinito...\r\n");
-			while (tx_tail != tx_head); _delay_ms(50);
+    for (;;)
+    {
+        uint8_t pulsado;
 
-			cli();
-			while (1) {
-				// Bucle infinito deliberado. El WDT morderá a los 2 segundos exactos.
-			}
-		}
-	}
-	return 0;
+        t = ahora_ms();
+
+        procesar_uart();
+
+        pulsado =
+            (uint8_t)(
+                (PIND & (1U << BOTON)) == 0U
+            );
+
+        /* DETECTAR NUEVA PULSACION */
+
+        if (pulsado && !presion_anterior)
+        {
+            inicio_pulsacion = t;
+            ultima_actividad = t;
+
+            if (estado == STANDBY ||
+                estado == SEGURO)
+            {
+                estado = ACTIVO;
+            }
+        }
+
+        presion_anterior = pulsado;
+
+        /* ESTADO ACTIVO */
+
+        if (estado == ACTIVO)
+        {
+            EIMSK &= (uint8_t)~(1U << INT0);
+
+            if (!(ADCSRA & (1U << ADEN)))
+                iniciar_adc();
+
+            PORTB |= (1U << VERDE);
+            PORTB &= (uint8_t)~(1U << AMARILLO);
+
+            mostrar_standby = 1;
+            mostrar_seguro = 1;
+
+            /* BLOQUEO POR PULSACION LARGA */
+
+            if (pulsado &&
+                (uint32_t)(t - inicio_pulsacion)
+                    >= 3000UL)
+            {
+                bloquear_por_wdt();
+            }
+
+            /* ACTUALIZACION ADC Y LCD */
+
+            if ((uint32_t)(t - ultima_lcd)
+                >= 1000UL)
+            {
+                ultima_lcd = t;
+
+                ultimo_adc = leer_adc();
+
+                snprintf(
+                    linea,
+                    sizeof(linea),
+                    "ADC: %u",
+                    (unsigned)ultimo_adc
+                );
+
+                lcd_mostrar(
+                    "ESTADO: ACTIVO",
+                    linea
+                );
+            }
+
+            /* PASO A STANDBY */
+
+            if ((uint32_t)(t - ultima_actividad)
+                >= 10000UL)
+            {
+                estado = STANDBY;
+                mostrar_standby = 1;
+            }
+        }
+
+        /* ESTADO STANDBY */
+
+        else if (estado == STANDBY)
+        {
+            PORTB &= (uint8_t)~(1U << VERDE);
+            PORTB |= (1U << AMARILLO);
+
+            if (mostrar_standby)
+            {
+                mostrar_standby = 0;
+
+                lcd_mostrar(
+                    "ESTADO: STANDBY",
+                    "Esperando..."
+                );
+
+                uart_texto("[STANDBY]\r\n");
+
+                int0_standby();
+
+                ADCSRA &= (uint8_t)~(1U << ADEN);
+
+                PRR |=
+                    (1U << PRADC) |
+                    (1U << PRSPI) |
+                    (1U << PRTIM0) |
+                    (1U << PRTIM2);
+            }
+
+            /* DESPERTAR DESDE STANDBY */
+
+            if (evento_boton || pulsado)
+            {
+                evento_boton = 0;
+
+                EIMSK &=
+                    (uint8_t)~(1U << INT0);
+
+                estado = ACTIVO;
+                ultima_actividad = t;
+
+                iniciar_adc();
+            }
+
+            /* PASO A POWER-DOWN */
+
+            else if (
+                (uint32_t)(t - ultima_actividad)
+                >= 30000UL)
+            {
+                estado = APAGADO;
+
+                entrar_powerdown();
+
+                ultima_lcd = ahora_ms();
+
+                /* CORRECCION DEL DESPERTAR */
+                inicio_pulsacion = ahora_ms();
+                presion_anterior = 1;
+            }
+
+            /* SLEEP IDLE */
+
+            else
+            {
+                set_sleep_mode(SLEEP_MODE_IDLE);
+
+                sleep_enable();
+                sleep_cpu();
+                sleep_disable();
+            }
+        }
+
+        /* ESTADO APAGADO */
+
+        else if (estado == APAGADO)
+        {
+            entrar_powerdown();
+        }
+
+        /* ESTADO SEGURO */
+
+        else if (estado == SEGURO)
+        {
+            PORTB &=
+                (uint8_t)~(
+                    (1U << VERDE) |
+                    (1U << AMARILLO) |
+                    (1U << ACTUADOR)
+                );
+
+            if (mostrar_seguro)
+            {
+                mostrar_seguro = 0;
+
+                lcd_mostrar(
+                    "ESTADO SEGURO",
+                    "PULSE DESPERTAR"
+                );
+            }
+        }
+
+        /* ALIMENTAR WDT EN FUNCIONAMIENTO NORMAL */
+
+        wdt_reset();
+
+        _delay_ms(5);
+    }
 }
+
