@@ -1,232 +1,330 @@
 /*
- * Lab 5 A.c con LCD I2C integrada
- *
- * Created: 6/11/2026 1:07:59
- * Author : UTEC-5695
+ * LABORATORIO 5 - PROBLEMA A - ATmega328P / Arduino Uno (16 MHz)
+ * LED PB5 (D13) | Buzzer PD3 (D3) | Pulsador INT0 PD2 (D2)
+ * DHT11 PD4 (D4) | ADC PC0 (A0) | LCD I2C PC4/PC5 (A4/A5)
+ * LCD PCF8574 = 0x27 (lcd_i2c.h)
+ * ACTIVO 0-10 s, STANDBY 10-30 s, POWER-DOWN a los 30 s.
+ * El pulsador despierta desde STANDBY y POWER-DOWN.
  */
-
 #define F_CPU 16000000UL
-#define PCF8574 0x27                            
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdio.h>
 #include <util/atomic.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdio.h>
 
-// Librerías de I2C, LCD y DHT11
 #include "i2c.h"
 #include "lcd_i2c.h"
 #include "dht11.h"
 
-volatile uint8_t flag_100ms = 0;
-volatile uint8_t flag_pulsador = 0;
-volatile uint8_t buzzer_activo = 0;
+#define LED_PIN       PB5
+#define BUZZER_PIN    PD3
+#define BOTON_PIN     PD2
 
-// Variables globales para almacenar las lecturas del DHT11
-uint8_t temperatura_actual = 0;
-uint8_t humedad_actual = 0;
+static volatile uint32_t ms_ticks = 0;
+static volatile uint8_t flag_100ms = 0;
+static volatile uint8_t flag_pulsador = 0;
 
-#define LED_PIN     PB5
-#define LED_DDR     DDRB
-#define LED_PORT    PORTB
+static uint32_t ultima_actividad = 0;
+static uint32_t ultimo_led = 0;
+static uint32_t ultima_lcd = 0;
+static uint32_t ultimo_dht = 0;
+static uint32_t fin_buzzer = 0;
 
-#define BUZZER_PIN  PD3
-#define BUZZER_DDR  DDRD
-#define BUZZER_PORT PORTD
+static uint16_t adc_actual = 0;
+static uint8_t temperatura = 0;
+static uint8_t humedad = 0;
+static uint8_t dht_valido = 0;
+static uint8_t buzzer_activo = 0;
+static uint8_t pantalla_estado = 0xFF;
 
-void estado_activo(void);
-void estado_standby(void);
-void estado_apagado(void);
-
+static void estado_activo(void);
+static void estado_standby(void);
+static void estado_apagado(void);
 typedef void (*fsm_state_t)(void);
-fsm_state_t current_state = estado_activo;
+static fsm_state_t estado_actual = estado_activo;
 
-volatile uint32_t ms_ticks = 0; 
-uint32_t last_activity_tick = 0;
-uint32_t buzzer_off_tick = 0; 
-
-uint8_t lcd_estado_actual_previo = 0xFF;
-
-void estado_activo(void) {
-    PRR = 0x00; 
-    if ((ms_ticks - last_activity_tick) >= 10000) {
-        current_state = estado_standby;
-        lcd_estado_actual_previo = 0xFF; 
-    }
+ISR(TIMER0_COMPA_vect)
+{
+    ms_ticks++;  /* Un milisegundo por interrupcion */
 }
 
-void estado_standby(void) {
-    if (lcd_estado_actual_previo != 1) {
-        LCD_Clear();
-        LCD_SetCursor(0, 0);
-        LCD_String("Esperando...");
-        LCD_SetCursor(1, 0);
-        LCD_String("Modo Standby");
-        lcd_estado_actual_previo = 1;
-    }
-
-    set_sleep_mode(SLEEP_MODE_IDLE);
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        sleep_enable();
-    }
-    sleep_cpu();
-    sleep_disable();
-
-    if ((ms_ticks - last_activity_tick) >= 30000) {
-        current_state = estado_apagado;
-        lcd_estado_actual_previo = 0xFF;
-    }
-}
-
-void estado_apagado(void) {
-    if (lcd_estado_actual_previo != 2) {
-        LCD_Clear();
-        LCD_SetCursor(0, 0);
-        LCD_String("Sistema Apagado");
-        lcd_estado_actual_previo = 2;
-    }
-    
-    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-    ADCSRA &= ~(1 << ADEN); 
-    
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        sleep_enable();
-        PRR |= (1 << PRADC); 
-    }
-    sleep_cpu();
-    sleep_disable();
-}
-
-void init_timers (void) {
-    TCCR0A = (1 << WGM01); 
-    TCCR0B = (1 << CS01) | (1 << CS00); 
-    OCR0A = 249;
-    TIMSK0 = (1 << OCIE0A); 
-    
-    TCCR1A = 0;
-    TCCR1B = (1 << WGM12) | (1 << CS12); 
-    OCR1A = 6249; 
-    TIMSK1 = (1 << OCIE1A);
-}
-
-void init_peripherals(void) {
-    LED_DDR |= (1 << LED_PIN);
-    
-    ADMUX = (1 << REFS0); 
-    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
-    
-    EICRA &= ~((1 << ISC01) | (1 << ISC00));
-    EIMSK |= (1 << INT0);
-    PORTD |= (1 << PD2);
-    
-    I2C_Init();
-    LCD_Init();
-    DHT_Init(); // Inicializar sensor DHT11
-    
-    LCD_Clear();
-    LCD_SetCursor(0, 0);
-    LCD_String("Sistema Iniciado");
-    _delay_ms(1000);
-}
-
-ISR(TIMER0_COMPA_vect) {
-    ms_ticks++;
-}
-
-ISR(TIMER1_COMPA_vect) {
+ISR(TIMER1_COMPA_vect)
+{
     flag_100ms = 1;
 }
 
-ISR(INT0_vect) {
+/* Desarmar INT0 impide una tormenta de interrupciones por nivel bajo. */
+ISR(INT0_vect)
+{
+    EIMSK &= (uint8_t)~(1U << INT0);
     flag_pulsador = 1;
 }
 
-int main(void) {
-    init_timers(); 
-    init_peripherals();
+static uint32_t ahora_ms(void)
+{
+    uint32_t t;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        t = ms_ticks;
+    }
+    return t;
+}
 
-    BUZZER_DDR |= (1 << BUZZER_PIN);
-    sei();
-    
-    uint32_t last_led = 0;
-    uint32_t last_lcd = 0;
-    uint32_t last_dht = 0;
-    
-    while (1) {
-        uint32_t current_ms;
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            current_ms = ms_ticks;
-        }
-        
-        current_state();
-        
-        // Parpadeo del LED cada 200 ms[cite: 4]
-        if (current_ms - last_led >= 200) {
-            last_led = current_ms;
-            LED_PORT ^= (1 << LED_PIN);
-        }
-        
-        if (flag_100ms) {
-            flag_100ms = 0;
-            ADCSRA |= (1 << ADSC); 
-        }
-        
-        // Actualización de la LCD cada 500 ms (Cooperativa)[cite: 4, 51]
-        if (current_state == estado_activo && (current_ms - last_lcd >= 500)) {
-            last_lcd = current_ms;
-            
-            uint16_t valor_adc = 0;
-            if (!(ADCSRA & (1 << ADSC))) {
-                valor_adc = ADC;
-            }
-            
-            char lcd_buffer[17];
-            LCD_Clear();
-            LCD_SetCursor(0, 0);
-            sprintf(lcd_buffer, "ADC:%u T:%uC", valor_adc, temperatura_actual);
-            LCD_String(lcd_buffer);
-            
-            LCD_SetCursor(1, 0);
-            sprintf(lcd_buffer, "Humedad: %u %%", humedad_actual);
-            LCD_String(lcd_buffer);
-        }
-        
-        // Lectura del sensor DHT11 cada 2000 ms (2 s como exige la norma del sensor)[cite: 3, 4, 43]
-        if (current_ms - last_dht >= 2000) {
-            last_dht = current_ms;
-            uint8_t t, h;
-            if (DHT_GetData(&t, &h)) {
-                temperatura_actual = t;
-                humedad_actual = h;
-            }
-        }
-        
-        // Control del buzzer
-        if (buzzer_activo && (current_ms >= buzzer_off_tick)) {
-            buzzer_activo = 0;
-        }
-        
-        if (buzzer_activo) {
-            BUZZER_PORT |= (1 << BUZZER_PIN);
+static void iniciar_timers(void)
+{
+    /* TIMER0: 1 ms; 16 MHz / 64 / (249+1) */
+    TCCR0A = (1U << WGM01);
+    TCCR0B = (1U << CS01) | (1U << CS00);
+    TCNT0 = 0;
+    OCR0A = 249;
+    TIMSK0 |= (1U << OCIE0A);
+
+    /* TIMER1: 100 ms; 16 MHz / 256 / (6249+1) */
+    TCCR1A = 0;
+    TCCR1B = (1U << WGM12) | (1U << CS12);
+    TCNT1 = 0;
+    OCR1A = 6249;
+    TIMSK1 |= (1U << OCIE1A);
+}
+
+static void iniciar_componentes(void)
+{
+    DDRB |= (1U << LED_PIN);
+    PORTB &= (uint8_t)~(1U << LED_PIN);
+
+    DDRD |= (1U << BUZZER_PIN);
+    PORTD &= (uint8_t)~(1U << BUZZER_PIN);
+
+    /* D2: pulsador contra GND y pull-up interno. */
+    DDRD &= (uint8_t)~(1U << BOTON_PIN);
+    PORTD |= (1U << BOTON_PIN);
+
+    /* INT0 con disparo por nivel bajo para despertar de POWER-DOWN. */
+    EICRA &= (uint8_t)~((1U << ISC01) | (1U << ISC00));
+    EIFR = (1U << INTF0);
+    EIMSK |= (1U << INT0);
+
+    PRR &= (uint8_t)~(1U << PRADC);
+    ADMUX = (1U << REFS0); /* Referencia AVcc, canal ADC0. */
+    ADCSRA = (1U << ADEN) | (1U << ADPS2) |
+             (1U << ADPS1) | (1U << ADPS0);
+
+    I2C_Init();
+    LCD_Init();
+    DHT_Init();
+}
+
+static uint16_t leer_adc(void)
+{
+    ADCSRA |= (1U << ADSC);
+    while (ADCSRA & (1U << ADSC)) { }
+    return ADC;
+}
+
+/* Rellenar los 16 caracteres: sin Clear cada medio segundo. */
+static void escribir_linea(uint8_t fila, const char *texto)
+{
+    uint8_t terminado = 0;
+    LCD_SetCursor(fila, 0);
+    for (uint8_t i = 0; i < 16; i++) {
+        if (!terminado && texto[i] != '\0') {
+            LCD_Char((uint8_t)texto[i]);
         } else {
-            BUZZER_PORT &= ~(1 << BUZZER_PIN);
+            terminado = 1;
+            LCD_Char(' ');
         }
-        
-        // Atención del pulsador (evento externo inmediato)[cite: 4]
-        if (flag_pulsador) {
-            flag_pulsador = 0;
-            last_activity_tick = current_ms; 
-            
-            if (current_state == estado_apagado || current_state == estado_standby) {
-                current_state = estado_activo;
-                lcd_estado_actual_previo = 0xFF;
-            }
-            
-            buzzer_activo = 1;
-            buzzer_off_tick = current_ms + 500; 
+    }
+}
+
+static void mostrar_medidas(void)
+{
+    char linea[17];
+    snprintf(linea, sizeof(linea), "ADC:%4u T:%2uC",
+             (unsigned)adc_actual, (unsigned)temperatura);
+    escribir_linea(0, linea);
+
+    if (dht_valido) {
+        snprintf(linea, sizeof(linea), "Humedad:%3u %%", (unsigned)humedad);
+        escribir_linea(1, linea);
+    } else {
+        escribir_linea(1, "DHT SIN LECTURA");
+    }
+}
+
+static void activar_modo_activo(uint32_t t)
+{
+    PRR &= (uint8_t)~(1U << PRADC);
+    ADCSRA |= (1U << ADEN);
+    estado_actual = estado_activo;
+    ultima_actividad = t;
+    pantalla_estado = 0xFF;
+    ultima_lcd = t - 500UL; /* Mostrar al siguiente ciclo. */
+    ultimo_dht = t - 2000UL;
+}
+
+static void procesar_pulsador(uint32_t t)
+{
+    if (flag_pulsador) {
+        flag_pulsador = 0;
+        activar_modo_activo(t);
+        buzzer_activo = 1;
+        fin_buzzer = t + 500UL;
+    }
+
+    /* Volver a habilitar INT0 solo al soltar D2. */
+    if ((PIND & (1U << BOTON_PIN)) && !(EIMSK & (1U << INT0))) {
+        EIFR = (1U << INTF0);
+        EIMSK |= (1U << INT0);
+    }
+}
+
+static void estado_activo(void)
+{
+    uint32_t t = ahora_ms();
+
+    if (pantalla_estado != 0) {
+        LCD_Clear();
+        pantalla_estado = 0;
+        ultima_lcd = t - 500UL;
+    }
+
+    if ((uint32_t)(t - ultimo_led) >= 200UL) {
+        ultimo_led = t;
+        PORTB ^= (1U << LED_PIN);
+    }
+
+    if (flag_100ms) {
+        flag_100ms = 0;
+        /* Lectura COMPLETA, no mostrar cero si esta convirtiendo. */
+        adc_actual = leer_adc();
+    }
+
+    if ((uint32_t)(t - ultimo_dht) >= 2000UL) {
+        uint8_t temp, hum;
+        ultimo_dht = t;
+        if (DHT_GetData(&temp, &hum)) {
+            temperatura = temp;
+            humedad = hum;
+            dht_valido = 1;
+        } else {
+            dht_valido = 0;
         }
+    }
+
+    if ((uint32_t)(t - ultima_lcd) >= 500UL) {
+        ultima_lcd = t;
+        mostrar_medidas();
+    }
+
+    if ((uint32_t)(t - ultima_actividad) >= 10000UL) {
+        estado_actual = estado_standby;
+        pantalla_estado = 0xFF;
+    }
+}
+
+static void estado_standby(void)
+{
+    uint32_t t = ahora_ms();
+
+    if (pantalla_estado != 1) {
+        PORTB &= (uint8_t)~(1U << LED_PIN);
+        LCD_Clear();
+        escribir_linea(0, "Esperando...");
+        escribir_linea(1, "Modo Standby");
+        pantalla_estado = 1;
+    }
+
+    if ((uint32_t)(t - ultima_actividad) >= 30000UL) {
+        estado_actual = estado_apagado;
+        pantalla_estado = 0xFF;
+        return;
+    }
+
+    /* El TIMER0 sigue activo y permite contar hasta los 30 s. */
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    cli();
+    sleep_enable();
+    sei();
+    sleep_cpu();
+    sleep_disable();
+}
+
+static void estado_apagado(void)
+{
+    if (pantalla_estado != 2) {
+        PORTB &= (uint8_t)~(1U << LED_PIN);
+        PORTD &= (uint8_t)~(1U << BUZZER_PIN);
+        buzzer_activo = 0;
+
+        LCD_Clear();
+        escribir_linea(0, "Sistema Apagado");
+        escribir_linea(1, "Pulse D2");
+        pantalla_estado = 2;
+        _delay_ms(500);
+
+        /* PCF8574: bit BL = 0. Escribir 0 apaga backlight. */
+        LCD_Write_I2C(0);
+    }
+
+    ADCSRA &= (uint8_t)~(1U << ADEN);
+    PRR |= (1U << PRADC);
+
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    cli();
+
+    /* Si el pulsador ya fue detectado, no dormir de nuevo. */
+    if (!flag_pulsador && (PIND & (1U << BOTON_PIN))) {
+        EIFR = (1U << INTF0);
+        EIMSK |= (1U << INT0);
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+    } else {
+        sei();
+    }
+
+    /* Reanudar perifericos y restaurar pantalla tras INT0. */
+    PRR &= (uint8_t)~(1U << PRADC);
+    ADCSRA |= (1U << ADEN);
+    I2C_Init();
+    LCD_Init();
+
+    activar_modo_activo(ahora_ms());
+    /* El main procesara flag_pulsador y activara el buzzer. */
+}
+
+int main(void)
+{
+    cli();
+    iniciar_timers();
+    iniciar_componentes();
+
+    LCD_Clear();
+    escribir_linea(0, "Sistema Iniciado");
+    escribir_linea(1, "Problema A");
+    _delay_ms(800);
+
+    ultimo_dht = ahora_ms() - 2000UL;
+    ultima_lcd = ahora_ms() - 500UL;
+    sei();
+
+    for (;;) {
+        uint32_t t = ahora_ms();
+
+        procesar_pulsador(t);
+
+        if (buzzer_activo && (int32_t)(t - fin_buzzer) >= 0)
+            buzzer_activo = 0;
+
+        if (buzzer_activo)
+            PORTD |= (1U << BUZZER_PIN);
+        else
+            PORTD &= (uint8_t)~(1U << BUZZER_PIN);
+
+        estado_actual();
     }
 }
